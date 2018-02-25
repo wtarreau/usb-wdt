@@ -48,7 +48,7 @@ INCLUDES =
 INCLUDES = -I".." -I"../../usbdrv" -I"../../libs-device"
 
 ## Objects that must be built in order to link
-OBJECTS = usbdrv.o usbdrvasm.o oddebug.o osccal.o sw-uart-asm.o sw-uart.o main.o
+OBJECTS = usbdrv.o usbdrvasm.o osccal.o main.o
 
 ## Objects explicitly added by the user
 LINKONLYOBJECTS = 
