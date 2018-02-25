@@ -9,7 +9,10 @@
  *
  * 2006-07-08   removed zero-sized receive block
  * 2006-07-08   adapted to higher baud rate by T.Kitazawa
+ * 2018-02-24   adapted to make a software USB Watchdog (wtarreau)
  *
+ *   avrdude -c buspirate -P /dev/ttyUSB0 -p attiny85 -v -U lfuse:w:0xe1:m
+ *   avrdude -c buspirate -P /dev/ttyUSB0 -p attiny85 -v -U flash:w:cdctiny45.hex
  */
 
 #include <string.h>
@@ -21,9 +24,9 @@
 #include <util/delay.h>
 
 #include "usbdrv.h"
-#include "oddebug.h"
-#include "uart.h"
 
+#define HW_CDC_BULK_OUT_SIZE    2
+#define HW_CDC_BULK_IN_SIZE     8
 
 enum {
     SEND_ENCAPSULATED_COMMAND = 0,
@@ -139,9 +142,76 @@ uchar usbFunctionDescriptor(usbRequest_t *rq)
 
 uchar               sendEmptyFrame;
 static uchar        intr3Status;    /* used to control interrupt endpoint transmissions */
+static uchar        rspbuf[HW_CDC_BULK_IN_SIZE];
+static uchar        iwptr; // #bytes to send from rspbuf (8 max)
 
-static usbWord_t    baud;
+/* uwd_dur : timer in multiples of 8ms or around 1/128 s
+ *   - if =0 : wdt stopped
+ *   - if >0 : wdt decrementing, will assert reset on 0
+ *   - if <0 : reset held, wdt incrementing, will release on 0.
+ */
+static short        uwd_dur; // multiples of 8 ms
 
+static enum {
+    CMD_ST_NONE = 0,
+    CMD_ST_L,
+    CMD_ST_O,
+    CMD_ST_OF,
+    CMD_ST_R,
+    CMD_ST_RS,
+} cmd_state = CMD_ST_NONE;
+
+/* ------------------------------------------------------------------------- */
+/* ----------------------- Watchdog manipulation --------------------------- */
+/* ------------------------------------------------------------------------- */
+
+static inline void led_set_state(uchar s)
+{
+    if (s)
+        PORTB |=  (1 << PB1);
+    else
+        PORTB &= ~(1 << PB1);
+}
+
+/* assert reset and turn on the LED */
+static inline void uwd_assert_reset()
+{
+    DDRB  |=  (1 << DDB0);
+    PORTB &= ~(1 << PB0);
+    led_set_state(1);
+}
+
+/* release reset and turn off the LED. The reset is turned back to pull-up. */
+static inline void uwd_release_reset()
+{
+    PORTB |=  (1 << PB0);
+    DDRB  &= ~(1 << DDB0);
+    led_set_state(0);
+}
+
+/* watchdog duration: 0..8 for ~0..255s (in fact, 0..255*1.024s) */
+static inline void uwd_set_duration(uchar d)
+{
+    uwd_dur = ((1U << d) - 1) << 7;
+}
+
+static inline void uwd_set_on()
+{
+    uwd_release_reset();
+    uwd_set_duration(0);
+}
+
+static inline void uwd_set_off()
+{
+    uwd_assert_reset();
+    uwd_set_duration(0);
+}
+
+static inline void uwd_reset()
+{
+    uwd_assert_reset();
+    uwd_dur = -64; // assert for 0.5 second
+}
 
 /* ------------------------------------------------------------------------- */
 /* ----------------------------- USB interface ----------------------------- */
@@ -182,8 +252,8 @@ usbRequest_t    *rq = (void *)data;
 uchar usbFunctionRead( uchar *data, uchar len )
 {
 
-    data[0] = baud.bytes[0];
-    data[1] = baud.bytes[1];
+    data[0] = 0; // baud
+    data[1] = 0; // baud
     data[2] = 0;
     data[3] = 0;
     data[4] = 0;
@@ -200,29 +270,75 @@ uchar usbFunctionRead( uchar *data, uchar len )
 
 uchar usbFunctionWrite( uchar *data, uchar len )
 {
-
-    /*    SET_LINE_CODING    */
-    baud.bytes[0] = data[0];
-    baud.bytes[1] = data[1];
-
-    uartInit(baud.word);
-
     return 1;
 }
 
+/*---------------------------------------------------------------------------*/
+/* DATA communication with the host below                                    */
+/*---------------------------------------------------------------------------*/
 
 void usbFunctionWriteOut( uchar *data, uchar len )
 {
 
-    /*  usb -> rs232c:  transmit char	*/
+    /* data received from usb */
     for( ; len; len-- ) {
-        tx_buf[uwptr++] = *data++;
-        uwptr    &= TX_MASK;
-    }
+        uchar c = *data++;
 
-    /*  postpone receiving next data    */
-    if( uartTxBytesFree()<HW_CDC_BULK_OUT_SIZE )
-        usbDisableAllRequests();
+        switch (cmd_state) {
+        case CMD_ST_NONE :
+            switch (c) {
+            case 'L' : cmd_state = CMD_ST_L; break;
+            case 'O' : cmd_state = CMD_ST_O; break;
+            case 'R' : cmd_state = CMD_ST_R; break;
+            case '0'...'8' :
+                uwd_set_duration(c - '0');
+                uwd_release_reset();
+                break;
+            case '?' :
+                /* returns   two bytes:
+                 *  - {'0'|'1'} : output state
+                 *  - [0..255]  : uwd_dur
+                 */
+                rspbuf[0] = '0' + !!(PINB & (1 << PB0));
+                rspbuf[1] = uwd_dur >> 7;
+                iwptr = 2;
+                break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        case CMD_ST_L :
+            switch (c) {
+            case '0'...'1' : led_set_state(c - '0'); cmd_state = CMD_ST_NONE; break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        case CMD_ST_O :
+            switch (c) {
+            case 'F' : cmd_state = CMD_ST_OF; break;
+            case 'N' : uwd_set_on(); cmd_state = CMD_ST_NONE; break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        case CMD_ST_OF :
+            switch (c) {
+            case 'F' : uwd_set_off(); cmd_state = CMD_ST_NONE; break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        case CMD_ST_R :
+            switch (c) {
+            case 'S' : cmd_state = CMD_ST_RS; break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        case CMD_ST_RS :
+            switch (c) {
+            case 'T' : uwd_reset(); cmd_state = CMD_ST_NONE; break;
+            default: cmd_state = CMD_ST_NONE;
+            }
+            break;
+        }
+    }
 }
 
 
@@ -249,9 +365,11 @@ static void hardwareInit(void)
     USBDDR    = 0;      /*  remove USB reset condition */
 #endif
 
-    /*    USART configuration    */
-    baud.word  = UART_DEFAULT_BPS;
-    uartInit(baud.word);
+    // PB1 as output (LED)
+    DDRB |= (1 << DDB1);
+
+    uwd_set_duration(0);
+    uwd_release_reset();
 }
 
 
@@ -261,7 +379,6 @@ int main(void)
 #if USB_CFG_HAVE_MEASURE_FRAME_LENGTH
 	oscInit();
 #endif
-    odDebugInit();
     hardwareInit();
     usbInit();
 
@@ -272,7 +389,22 @@ int main(void)
     for(;;){    /* main event loop */
         wdt_reset();
         usbPoll();
-        uartPoll();
+
+        /*
+         * send to USB if needed
+         */
+
+        /*  host <= device : transmit   */
+        if( usbInterruptIsReady() && (iwptr||sendEmptyFrame) ) {
+            usbSetInterrupt(rspbuf, iwptr);
+            sendEmptyFrame    = iwptr & HW_CDC_BULK_IN_SIZE;
+            iwptr    = 0;
+        }
+
+        /*  host => device : accept     */
+        if( usbAllRequestsAreDisabled() ) {
+            usbEnableAllRequests();
+        }
 
         /* We need to report rx and tx carrier after open attempt */
         if(intr3Status != 0 && usbInterruptIsReady3()){
@@ -285,6 +417,22 @@ int main(void)
             }
             intr3Status--;
         }
+
+        if (uwd_dur > 0) {
+            uwd_dur--;
+            if (!uwd_dur)
+                uwd_reset();
+        }
+        else if (uwd_dur < 0) {
+            uwd_dur++;
+            if (!uwd_dur)
+                uwd_release_reset();
+        }
+
+        // Note: must not wait more than 50ms otherwise the device gets
+        // disconnected! Here 8 ms is fine, as it's around 1/128 second so
+        // we use it as a time base for uwd_dur.
+        _delay_ms(8);
     }
     return 0;
 }
