@@ -14,34 +14,11 @@ SUMMARY
     low-speed USB. It provides the RS-232C interface through virtual COM
     port. The AVR-CDC is originally developed by Osamu Tamura.
     Akira Kitazawa has significantly contributed to improve this software. 
+    Willy Tarreau then modified it to turn it into a simple watchdog instead.
 
 
 SPECIFICATION
 =============
-    AVR-CDC with USART (ATmega8/48/88/168)
-        speed:     600 - 38400bps
-        datasize: 5-8
-        parity:   none/even/odd
-        stopbit:  1/2
-        controls: DTR, RTS, CTS
-
-    AVR-CDC with USART (ATtiny2313)
-        speed:     600 - 38400bps
-        datasize: 8
-        parity:   none
-        stopbit:  1
-
-    AVR-CDC without USART (ATtiny45/85)
-        speed:    1200 -  4800bps
-        datasize: 8
-        parity:   none
-        stopbit:  1
-        supply current: 8-15mA
-
-    The RTS indicates that the receive buffer is not full, and the CTS stops
-    sending data at '0' input. These controls cannot be controlled/read by the
-    host PC (ATmega). 
-
     Internal RC Oscillator is calibrated at startup time on ATtiny45/85.
     When the other low speed device is connected under the same host 
     controller, the ATtiny45/85 may fail to be recognized by the downstream
