@@ -28,6 +28,60 @@ SPECIFICATION
     OS 9.1/X, and Linux 2.4 or 2.6.31-, low-speed bulk transfer is not allowed
     by the USB standard. Use CDC-232 at your own risk.
 
+    The device presents itself as a CDC-ACM serial port, and uses this to
+    manipulate output pin PB0 used to power-off a system when it's going
+    down. A LED connected to PB1 is used as well to indicate when the power
+    off pin is asserted. It can both be used remotely (power on/off) and
+    locally via a timer (as a watchdog). The watchdog reset is implemented
+    by turning the power off, then on after 0.5 second.
+
+    It receives the following commands as strings from the USB port :
+      - 0     : disables the watchdog
+      - 1..8  : schedules a reset after 2^N-1 seconds (1..255)
+      - OFF   : power off
+      - ON    : power on
+      - RST   : triggers a reset immediately.
+      - L0/L1 : turns the LED off/on (to test communication without resetting)
+      - ?     : retrieves current state on 2 bytes. First byte indicates the
+                level of the pin, which is set as an input when not off, allowing
+                to check a power supply's status. '0' indicates it's off (or
+                forced off), '1' indicates it's on (or disconnected). The second
+                byte indicates the remaining amount of seconds before reset.
+
+    All unknown characters reset the parser, so CR, LF, spaces etc will not cause
+    any trouble.
+
+    All commands which manipulate the timer or the output (0..8, ON, OFF, RST)
+    automatically disable any pending timer. The device takes a great care not
+    to influence the output during boot, and doesn't automatically start. This
+    way it's possible to leave it connected inside a machine and to turn it on
+    by software. It may also be used as a self-reset function by writing "RST"
+    to the device.
+
+    A typical use case is to connect the output via a MOSFET to the PWROK
+    pin of an ATX power supply. This way, when going down it will turn the
+    motherboard's power off. If the device is powered from the motherboard,
+    it will automatically stop asserting the signal, letting the board
+    automatically restart. A typical connection looks like this :
+
+      +5V
+      -----+------------+
+           |            | BS170
+       ,---+----.     G |
+       | ATtiny |   S ===== D  ____
+       | 45/85  +------' '----|____|---> PWROK
+       `---+----'              180R
+           |
+      -----+---------------------------> GND
+
+    The resistor is here to limit the output current to less than 30 mA (the
+    PWROK signal is very sensitive and designed to deliver at least 200 uA,
+    but in case a power supply uses a buffer on the output, we don't want to
+    fry it).
+
+    The BS170 includes a reverse diode allowing the PWROK signal to be sampled
+    by the output pin when used as an input.
+
 
 USAGE
 =====
